@@ -10,6 +10,13 @@
 
 #include "touch.h"
 
+/* this macro is used to tell if "bit" is set in "array"
+ * it selects a byte from the array, and does a boolean AND
+ * operation with a byte that only has the relevant bit set.
+ * eg. to check for the 12th bit, we do (array[1] & 1<<4)
+ */
+#define test_bit(bit, array)    (array[bit/8] & (1<<(bit%8)))
+
 static int find_dev() {
   int err;
 
@@ -24,15 +31,11 @@ static int find_dev() {
     int fd = openat(dirfd(dir), de->d_name, O_RDONLY);
     assert(fd >= 0);
 
-    char name[128] = {0};
-    err = ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name);
+    unsigned char ev_bits[KEY_MAX / 8 + 1];
+    err = ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(ev_bits)), ev_bits);
     assert(err >= 0);
 
-    unsigned long ev_bits[8] = {0};
-    err = ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), ev_bits);
-    assert(err >= 0);
-
-    if (strncmp(name, "synaptics", 9) == 0 && ev_bits[0] == 0xb) {
+    if (test_bit(ABS_MT_POSITION_X, ev_bits) && test_bit(ABS_MT_POSITION_Y, ev_bits)) {
       ret = fd;
       break;
     }
@@ -48,7 +51,7 @@ void touch_init(TouchState *s) {
   assert(s->fd >= 0);
 }
 
-int touch_poll(TouchState *s, int* out_x, int* out_y) {
+int touch_poll(TouchState *s, int* out_x, int* out_y, int timeout) {
   assert(out_x && out_y);
   bool up = false;
   while (true) {
@@ -56,7 +59,7 @@ int touch_poll(TouchState *s, int* out_x, int* out_y) {
       .fd = s->fd,
       .events = POLLIN,
     }};
-    int err = poll(polls, 1, 0);
+    int err = poll(polls, 1, timeout);
     if (err < 0) {
       return -1;
     }
@@ -70,17 +73,13 @@ int touch_poll(TouchState *s, int* out_x, int* out_y) {
       return -1;
     }
 
-    switch (event.type) { 
+    switch (event.type) {
     case EV_ABS:
       if (event.code == ABS_MT_POSITION_X) {
         s->last_x = event.value;
       } else if (event.code == ABS_MT_POSITION_Y) {
         s->last_y = event.value;
-      }
-      break;
-    case EV_KEY:
-      if (event.code == BTN_TOOL_FINGER && event.value == 0) {
-        // finger up
+      } else if (event.code == ABS_MT_TRACKING_ID && event.value != -1) {
         up = true;
       }
       break;
@@ -89,10 +88,37 @@ int touch_poll(TouchState *s, int* out_x, int* out_y) {
     }
   }
   if (up) {
-    // adjust for landscape
-    *out_x = 1920 - s->last_y;
-    *out_y = s->last_x;
+    // adjust for flippening
+    *out_x = s->last_y;
+    *out_y = 1080 - s->last_x;
   }
   return up;
 }
 
+int touch_read(TouchState *s, int* out_x, int* out_y) {
+  assert(out_x && out_y);
+  struct input_event event;
+  int err = read(s->fd, &event, sizeof(event));
+  if (err < sizeof(event)) {
+    return -1;
+  }
+  bool up = false;
+  switch (event.type) {
+  case EV_ABS:
+    if (event.code == ABS_MT_POSITION_X) {
+      s->last_x = event.value;
+    } else if (event.code == ABS_MT_POSITION_Y) {
+      s->last_y = event.value;
+    }
+    up = true;
+    break;
+  default:
+    break;
+  }
+  if (up) {
+    // adjust for flippening
+    *out_x = s->last_y;
+    *out_y = 1080 - s->last_x;
+  }
+  return up;
+}

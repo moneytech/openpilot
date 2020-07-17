@@ -8,13 +8,16 @@ The project to democratize access to the decoder ring of your car.
 ### DBC file basics
 
 A DBC file encodes, in a humanly readable way, the information needed to understand a vehicle's CAN bus traffic. A vehicle might have multiple CAN buses and every CAN bus is represented by its own dbc file.
-Wondering what's the DBC file format? [Here](http://www.socialledge.com/sjsu/index.php?title=DBC_Format) a good overview.
+Wondering what's the DBC file format? [Here](http://www.socialledge.com/sjsu/index.php?title=DBC_Format) and [Here](https://github.com/stefanhoelzl/CANpy/blob/master/docs/DBC_Specification.md) a couple of good overviews.
 
 ### How to start reverse engineering cars
 
 [opendbc](https://github.com/commaai/opendbc) is integrated with [cabana](https://community.comma.ai/cabana/).
 
 Use [panda](https://github.com/commaai/panda) to connect your car to a computer.
+
+### How to use reverse engineered DBC
+To create custom CAN simulations or send reverse engineered signals back to the car you can use [CANdevStudio](https://github.com/GENIVI/CANdevStudio) project.
 
 ### DBC file preprocessor
 
@@ -42,7 +45,7 @@ For example:
     SG_ VEHICLE_SPEED : 7|15@0+ (0.01,0) [0|250] "kph" PCM
     ```
 
-- Signal's size: always use the smallest amount of bits possible. For example, let's say I'm reverse engineering the gas pedal position and I've determined that it's in a 3 bytes message. For 0% pedal position I read a message value of `0x00 0x00 0x00`, while for 100% of pedal position I read `0x64 0x00 0x00`: clearly, the gas pedal position is within the first byte of the message and I might be tempted to define the signal `GAS_POS` as:
+- Signal size: always use the smallest amount of bits possible. For example, let's say I'm reverse engineering the gas pedal position and I've determined that it's in a 3 bytes message. For 0% pedal position I read a message value of `0x00 0x00 0x00`, while for 100% of pedal position I read `0x64 0x00 0x00`: clearly, the gas pedal position is within the first byte of the message and I might be tempted to define the signal `GAS_POS` as:
     ```
     SG_ GAS_POS : 7|8@0+ (1,0) [0|100] "%" PCM
     ```

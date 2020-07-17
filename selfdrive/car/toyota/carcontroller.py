@@ -1,25 +1,19 @@
+from cereal import car
 from common.numpy_fast import clip
-from selfdrive.boardd.boardd import can_list_to_can_capnp
-from selfdrive.car.toyota.toyotacan import make_can_msg, create_video_target,\
-                                           create_steer_command, create_ui_command, \
-                                           create_ipas_steer_command, create_accel_command, \
+from selfdrive.car import apply_toyota_steer_torque_limits, create_gas_command, make_can_msg
+from selfdrive.car.toyota.toyotacan import create_steer_command, create_ui_command, \
+                                           create_accel_command, create_acc_cancel_command, \
                                            create_fcw_command
-from selfdrive.car.toyota.values import ECU, STATIC_MSGS
+from selfdrive.car.toyota.values import Ecu, CAR, STATIC_MSGS, SteerLimitParams
+from opendbc.can.packer import CANPacker
 
+VisualAlert = car.CarControl.HUDControl.VisualAlert
+
+# Accel limits
 ACCEL_HYST_GAP = 0.02  # don't change accel command for small oscilalitons within this value
-ACCEL_MAX = 1500  # 1.5 m/s2
-ACCEL_MIN = -3000 # 3   m/s2
+ACCEL_MAX = 1.5  # 1.5 m/s2
+ACCEL_MIN = -3.0 # 3   m/s2
 ACCEL_SCALE = max(ACCEL_MAX, -ACCEL_MIN)
-
-STEER_MAX = 1500
-STEER_DELTA_UP = 10        # 1.5s time to peak torque
-STEER_DELTA_DOWN = 25      # always lower than 45 otherwise the Rav4 faults (Prius seems ok with 50)
-STEER_ERROR_MAX = 350      # max delta between torque cmd and torque motor
-
-TARGET_IDS = [0x340, 0x341, 0x342, 0x343, 0x344, 0x345,
-              0x363, 0x364, 0x365, 0x370, 0x371, 0x372,
-              0x373, 0x374, 0x375, 0x380, 0x381, 0x382,
-              0x383]
 
 def accel_hysteresis(accel, accel_steady, enabled):
 
@@ -36,79 +30,66 @@ def accel_hysteresis(accel, accel_steady, enabled):
   return accel, accel_steady
 
 
-def process_hud_alert(hud_alert, audible_alert):
-  # initialize to no alert
-  steer = 0
-  fcw = 0
-  sound1 = 0
-  sound2 = 0
-
-  if hud_alert == 'fcw':
-    fcw = 1
-  elif hud_alert == 'steerRequired':
-    steer = 1
-
-  if audible_alert == 'chimeRepeated':
-    sound1 = 1
-  elif audible_alert in ['beepSingle', 'chimeSingle', 'chimeDouble']:
-    # TODO: find a way to send single chimes
-    sound2 = 1
-
-  return steer, fcw, sound1, sound2
-
-
-class CarController(object):
-  def __init__(self, car_fingerprint, enable_camera, enable_dsu, enable_apg):
-    self.braking = False
-    # redundant safety check with the board
-    self.controls_allowed = True
-    self.last_steer = 0.
+class CarController():
+  def __init__(self, dbc_name, CP, VM):
+    self.last_steer = 0
     self.accel_steady = 0.
-    self.car_fingerprint = car_fingerprint
     self.alert_active = False
     self.last_standstill = False
     self.standstill_req = False
 
-    self.fake_ecus = set()
-    if enable_camera: self.fake_ecus.add(ECU.CAM)
-    if enable_dsu: self.fake_ecus.add(ECU.DSU)
-    if enable_apg: self.fake_ecus.add(ECU.APGS)
+    self.last_fault_frame = -200
+    self.steer_rate_limited = False
 
-  def update(self, sendcan, enabled, CS, frame, actuators,
-             pcm_cancel_cmd, hud_alert, audible_alert):
+    self.fake_ecus = set()
+    if CP.enableCamera:
+      self.fake_ecus.add(Ecu.fwdCamera)
+    if CP.enableDsu:
+      self.fake_ecus.add(Ecu.dsu)
+
+    self.packer = CANPacker(dbc_name)
+
+  def update(self, enabled, CS, frame, actuators, pcm_cancel_cmd, hud_alert,
+             left_line, right_line, lead, left_lane_depart, right_lane_depart):
 
     # *** compute control surfaces ***
 
-    # steer torque is converted back to CAN reference (positive when steering right)
-    apply_accel = actuators.gas - actuators.brake
-    apply_accel, self.accel_steady = accel_hysteresis(apply_accel, self.accel_steady, enabled)
-    apply_accel = int(round(clip(apply_accel * ACCEL_SCALE, ACCEL_MIN, ACCEL_MAX)))
+    # gas and brake
 
-    # steer torque is converted back to CAN reference (positive when steering right)
-    apply_steer = int(round(actuators.steer * STEER_MAX))
+    apply_gas = clip(actuators.gas, 0., 1.)
 
-    max_lim = min(max(CS.steer_torque_motor + STEER_ERROR_MAX, STEER_ERROR_MAX), STEER_MAX)
-    min_lim = max(min(CS.steer_torque_motor - STEER_ERROR_MAX, -STEER_ERROR_MAX), -STEER_MAX)
-
-    apply_steer = clip(apply_steer, min_lim, max_lim)
-
-    # slow rate if steer torque increases in magnitude
-    if self.last_steer > 0:
-      apply_steer = clip(apply_steer, max(self.last_steer - STEER_DELTA_DOWN, - STEER_DELTA_UP), self.last_steer + STEER_DELTA_UP)
+    if CS.CP.enableGasInterceptor:
+      # send only negative accel if interceptor is detected. otherwise, send the regular value
+      # +0.06 offset to reduce ABS pump usage when OP is engaged
+      apply_accel = 0.06 - actuators.brake
     else:
-      apply_steer = clip(apply_steer, self.last_steer - STEER_DELTA_UP, min(self.last_steer + STEER_DELTA_DOWN, STEER_DELTA_UP))
+      apply_accel = actuators.gas - actuators.brake
+
+    apply_accel, self.accel_steady = accel_hysteresis(apply_accel, self.accel_steady, enabled)
+    apply_accel = clip(apply_accel * ACCEL_SCALE, ACCEL_MIN, ACCEL_MAX)
+
+    # steer torque
+    new_steer = int(round(actuators.steer * SteerLimitParams.STEER_MAX))
+    apply_steer = apply_toyota_steer_torque_limits(new_steer, self.last_steer, CS.out.steeringTorqueEps, SteerLimitParams)
+    self.steer_rate_limited = new_steer != apply_steer
+
+    # only cut torque when steer state is a known fault
+    if CS.steer_state in [9, 25]:
+      self.last_fault_frame = frame
+
+    # Cut steering for 2s after fault
+    if not enabled or (frame - self.last_fault_frame < 200):
+      apply_steer = 0
+      apply_steer_req = 0
+    else:
+      apply_steer_req = 1
 
     if not enabled and CS.pcm_acc_status:
       # send pcm acc cancel cmd if drive is disabled but pcm is still on, or if the system can't be activated
       pcm_cancel_cmd = 1
 
-    # dropping torque immediately might cause eps to temp fault. On the other hand, safety_toyota
-    # cuts steer torque immediately anyway TODO: monitor if this is a real issue
-    if not enabled or CS.steer_error:
-      apply_steer = 0
-
     # on entering standstill, send standstill request
-    if CS.standstill and not self.last_standstill:
+    if CS.out.standstill and not self.last_standstill:
       self.standstill_req = True
     if CS.pcm_acc_status != 8:
       # pcm entered standstill or it's disabled
@@ -116,67 +97,66 @@ class CarController(object):
 
     self.last_steer = apply_steer
     self.last_accel = apply_accel
-    self.last_standstill = CS.standstill
+    self.last_standstill = CS.out.standstill
 
     can_sends = []
 
     #*** control msgs ***
-    #print "steer", apply_steer, min_lim, max_lim, CS.steer_torque_motor
+    #print("steer {0} {1} {2} {3}".format(apply_steer, min_lim, max_lim, CS.steer_torque_motor)
 
     # toyota can trace shows this message at 42Hz, with counter adding alternatively 1 and 2;
     # sending it at 100Hz seem to allow a higher rate limit, as the rate limit seems imposed
     # on consecutive messages
-    if ECU.CAM in self.fake_ecus:
-      can_sends.append(create_steer_command(apply_steer, frame))
+    if Ecu.fwdCamera in self.fake_ecus:
+      can_sends.append(create_steer_command(self.packer, apply_steer, apply_steer_req, frame))
 
-    if ECU.APGS in self.fake_ecus:
-      can_sends.append(create_ipas_steer_command(apply_steer))
+      # LTA mode. Set ret.steerControlType = car.CarParams.SteerControlType.angle and whitelist 0x191 in the panda
+      # if frame % 2 == 0:
+      #   can_sends.append(create_steer_command(self.packer, 0, 0, frame // 2))
+      #   can_sends.append(create_lta_steer_command(self.packer, actuators.steerAngle, apply_steer_req, frame // 2))
 
-    # accel cmd comes from DSU, but we can spam can to cancel the system even if we are using lat only control
-    if (frame % 3 == 0 and ECU.DSU in self.fake_ecus) or (pcm_cancel_cmd and ECU.CAM in self.fake_ecus):
-      if ECU.DSU in self.fake_ecus:
-        can_sends.append(create_accel_command(apply_accel, pcm_cancel_cmd, self.standstill_req))
+    # we can spam can to cancel the system even if we are using lat only control
+    if (frame % 3 == 0 and CS.CP.openpilotLongitudinalControl) or (pcm_cancel_cmd and Ecu.fwdCamera in self.fake_ecus):
+      lead = lead or CS.out.vEgo < 12.    # at low speed we always assume the lead is present do ACC can be engaged
+
+      # Lexus IS uses a different cancellation message
+      if pcm_cancel_cmd and CS.CP.carFingerprint == CAR.LEXUS_IS:
+        can_sends.append(create_acc_cancel_command(self.packer))
+      elif CS.CP.openpilotLongitudinalControl:
+        can_sends.append(create_accel_command(self.packer, apply_accel, pcm_cancel_cmd, self.standstill_req, lead))
       else:
-        can_sends.append(create_accel_command(0, pcm_cancel_cmd, False))
+        can_sends.append(create_accel_command(self.packer, 0, pcm_cancel_cmd, False, lead))
 
-    if frame % 10 == 0 and ECU.CAM in self.fake_ecus:
-      for addr in TARGET_IDS:
-        can_sends.append(create_video_target(frame/10, addr))
+    if (frame % 2 == 0) and (CS.CP.enableGasInterceptor):
+      # send exactly zero if apply_gas is zero. Interceptor will send the max between read value and apply_gas.
+      # This prevents unexpected pedal range rescaling
+      can_sends.append(create_gas_command(self.packer, apply_gas, frame//2))
 
     # ui mesg is at 100Hz but we send asap if:
     # - there is something to display
     # - there is something to stop displaying
-    alert_out = process_hud_alert(hud_alert, audible_alert)
-    steer, fcw, sound1, sound2 = alert_out
+    fcw_alert = hud_alert == VisualAlert.fcw
+    steer_alert = hud_alert == VisualAlert.steerRequired
 
-    if (any(alert_out) and not self.alert_active) or \
-       (not any(alert_out) and self.alert_active):
+    send_ui = False
+    if ((fcw_alert or steer_alert) and not self.alert_active) or \
+       (not (fcw_alert or steer_alert) and self.alert_active):
       send_ui = True
       self.alert_active = not self.alert_active
-    else:
-      send_ui = False
+    elif pcm_cancel_cmd:
+      # forcing the pcm to disengage causes a bad fault sound so play a good sound instead
+      send_ui = True
 
-    if (frame % 100 == 0 or send_ui) and ECU.CAM in self.fake_ecus:
-      can_sends.append(create_ui_command(steer, sound1, sound2))
-      can_sends.append(create_fcw_command(fcw))
+    if (frame % 100 == 0 or send_ui) and Ecu.fwdCamera in self.fake_ecus:
+      can_sends.append(create_ui_command(self.packer, steer_alert, pcm_cancel_cmd, left_line, right_line, left_lane_depart, right_lane_depart))
+
+    if frame % 100 == 0 and Ecu.dsu in self.fake_ecus:
+      can_sends.append(create_fcw_command(self.packer, fcw_alert))
 
     #*** static msgs ***
 
     for (addr, ecu, cars, bus, fr_step, vl) in STATIC_MSGS:
-      if frame % fr_step == 0 and ecu in self.fake_ecus and self.car_fingerprint in cars:
-        # special cases
-        if fr_step == 5 and ecu == ECU.CAM and bus == 1:
-          cnt = (((frame / 5) % 7) + 1) << 5
-          vl = chr(cnt) + vl
-        elif addr in (0x489, 0x48a) and bus == 0:
-          # add counter for those 2 messages (last 4 bits)
-          cnt = ((frame/100)%0xf) + 1
-          if addr == 0x48a:
-            # 0x48a has a 8 preceding the counter
-            cnt += 1 << 7
-          vl += chr(cnt)
+      if frame % fr_step == 0 and ecu in self.fake_ecus and CS.CP.carFingerprint in cars:
+        can_sends.append(make_can_msg(addr, vl, bus))
 
-        can_sends.append(make_can_msg(addr, vl, bus, False))
-
-
-    sendcan.send(can_list_to_can_capnp(can_sends, msgtype='sendcan').to_bytes())
+    return can_sends

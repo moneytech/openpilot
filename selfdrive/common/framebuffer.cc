@@ -1,4 +1,3 @@
-
 #include <cstdio>
 #include <cstdlib>
 #include <cassert>
@@ -39,7 +38,6 @@ extern "C" void framebuffer_set_power(FramebufferState *s, int mode) {
 
 extern "C" FramebufferState* framebuffer_init(
     const char* name, int32_t layer, int alpha,
-    EGLDisplay *out_display, EGLSurface *out_surface,
     int *out_w, int *out_h) {
   status_t status;
   int success;
@@ -56,8 +54,8 @@ extern "C" FramebufferState* framebuffer_init(
   status = SurfaceComposerClient::getDisplayInfo(s->dtoken, &s->dinfo);
   assert(status == 0);
 
-  int orientation = 3; // rotate framebuffer 270 degrees
-  //int orientation = 1; // rotate framebuffer 90 degrees
+  //int orientation = 3; // rotate framebuffer 270 degrees
+  int orientation = 1; // rotate framebuffer 90 degrees
   if(orientation == 1 || orientation == 3) {
       int temp = s->dinfo.h;
       s->dinfo.h = s->dinfo.w;
@@ -128,14 +126,20 @@ extern "C" FramebufferState* framebuffer_init(
 
   // set brightness
   int brightness_fd = open(BACKLIGHT_CONTROL, O_RDWR);
-  const char brightness_level[] = BACKLIGHT_LEVEL;
-  write(brightness_fd, brightness_level, strlen(brightness_level));
+  if (brightness_fd != -1){
+    const char brightness_level[] = BACKLIGHT_LEVEL;
+    write(brightness_fd, brightness_level, strlen(brightness_level));
+    close(brightness_fd);
+  }
 
-
-  if (out_display) *out_display = s->display;
-  if (out_surface) *out_surface = s->surface;
   if (out_w) *out_w = w;
   if (out_h) *out_h = h;
 
   return s;
 }
+
+extern "C" void framebuffer_swap(FramebufferState *s) {
+  eglSwapBuffers(s->display, s->surface);
+  assert(glGetError() == GL_NO_ERROR);
+}
+
